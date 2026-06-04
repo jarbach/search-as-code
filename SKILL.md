@@ -1,8 +1,8 @@
-# Search-as-Code SDK v0.2.1
+# Search-as-Code SDK v0.3.0
 
 **Location:** `/workspace/skills/auto-generated/search-as-code/`
 
-**Phase:** 2 Complete (LLM Smart Compression + Cross-Session Caching + Gateway HTTP API)
+**Phase:** 3 Complete (Rate Limiting + Circuit Breaker + 4 Advanced Primitives)
 
 **Status:** ✅ Production Ready
 
@@ -31,6 +31,10 @@ Fine-grained operations that can be chained:
 | `compress()` | Token budget enforcement (truncate or summarize) | `.compress(target_tokens=800, strategy="summarize")` |
 | `extract()` | CSS selector extraction | `.extract({"title": "h1", "content": ".article"})` |
 | **`use_cache`** | Enable/disable cross-session caching | `.search("query", use_cache=True)` |
+| **`cluster()`** ⭐NEW | Group by topic/embedding similarity | `.cluster(n_clusters=3)` |
+| **`timeline()`** ⭐NEW | Sort by date, detect trends | `.timeline(order="desc", time_buckets="month")` |
+| **`sentiment()`** ⭐NEW | Analyze tone/bias with LLM | `.sentiment(analyze_bias=True)` |
+| **`alert()`** ⭐NEW | Monitor for new results | `.alert("baseline", create_baseline=False)` |
 
 ### Pre-built Pipelines
 
@@ -236,20 +240,30 @@ python examples/smart_compression.py
 
 # Phase 2: Caching integration test
 python examples/test_caching_integration.py
+
+# Phase 3: Rate limiting + advanced primitives
+python test_phase3.py                    # Full test suite
+python sdk.py cluster                    # Clustering demo
+python sdk.py timeline                   # Timeline analysis demo
+python sdk.py sentiment                  # Sentiment analysis demo
+python sdk.py rate_limit                 # Rate limiting demo
 ```
 
-See `PHASE_2_COMPLETE.md` for comprehensive test results.
+See `PHASE_2_COMPLETE.md` and `PHASE_3_COMPLETE.md` for comprehensive test results.
 
 ---
 
-## Limitations (Phase 2)
+## Limitations (Phase 3)
 
 1. **HTTP overhead**: Each tool call is an HTTP request (~50-100ms overhead)
 2. **Auth required**: Needs Gateway token in environment or hardcoded
 3. **Tool policy**: Subject to Gateway tool allowlist/denylist
 4. **No sandbox isolation**: Code runs at host level (trust the agent)
-5. **LLM latency**: Smart compression adds ~3-5s per batch (local inference)
+5. **LLM latency**: Smart compression adds ~3-5s per batch; sentiment analysis adds ~3-5s per batch
 6. **Cache storage**: Search queries stored in SQLite (consider encryption for sensitive use cases)
+7. **Keyword clustering**: Current implementation uses term frequency, not embeddings
+8. **Date extraction**: TimelineOp relies on regex patterns, may miss non-standard formats
+9. **Rate limiter scope**: Per-process, not global across multiple SDK instances
 
 ---
 
@@ -257,14 +271,21 @@ See `PHASE_2_COMPLETE.md` for comprehensive test results.
 
 ```
 search-as-code/
-├── sdk.py                    # Core SDK (this file)
+├── sdk.py                    # Core SDK with all primitives
+├── cache.py                  # Phase 2: Cross-session caching
+├── rate_limiter.py           # Phase 3: Rate limiting + circuit breaker
 ├── openclaw_plugin.py        # OpenClaw plugin wrapper (TODO)
 ├── examples/
 │   ├── basic_search.py       # Basic usage examples
 │   ├── research_pipeline.py  # Research workflow
-│   └── competitive_analysis.py # Competitive intel
+│   ├── competitive_analysis.py # Competitive intel
+│   ├── smart_compression.py  # Phase 2 LLM summarization
+│   └── test_caching_integration.py # Phase 2 cache tests
 ├── SKILL.md                  # This documentation
-└── TEST_RESULTS.md           # Validation results (TODO)
+├── PHASE_2_COMPLETE.md       # Phase 2 completion report
+├── PHASE_3_COMPLETE.md       # Phase 3 completion report
+├── test_phase3.py            # Phase 3 test suite
+└── TEST_RESULTS.md           # Validation results
 ```
 
 ---

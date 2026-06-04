@@ -1,0 +1,68 @@
+# Search-as-Code SDK - Optional Dependencies
+
+## Core Requirements (Phase 1-2)
+
+```bash
+pip install beautifulsoup4 aiohttp
+```
+
+## Phase 3 Enhancements
+
+No additional dependencies required. Uses standard library only.
+
+## Phase 3.5 Enhancements (Optional)
+
+### Embedding-Based Clustering
+
+For semantic clustering with sentence-transformers:
+
+```bash
+pip install sentence-transformers scikit-learn numpy
+```
+
+**Model:** `all-MiniLM-L6-v2` (default)
+- Fast CPU inference
+- 80MB model size
+- Good quality for general text
+
+**Alternative models:**
+- `all-mpnet-base-v2` - Higher quality, slower
+- `paraphrase-multilingual-MiniLM-L12-v2` - Multi-language support
+
+### Cache Encryption
+
+For encrypting sensitive alert baselines:
+
+```bash
+pip install cryptography
+```
+
+**Security:** Uses Fernet symmetric encryption with PBKDF2HMAC key derivation.
+
+**Setup:**
+```bash
+export SEARCH_CACHE_ENCRYPTION_KEY="your-secret-passphrase"
+```
+
+⚠️ **Important:** Store the encryption key securely. Lost keys = unrecoverable baselines.
+
+## Full Installation (All Features)
+
+```bash
+cd /workspace/skills/auto-generated/search-as-code/
+pip install beautifulsoup4 aiohttp sentence-transformers scikit-learn numpy cryptography
+```
+
+## Verify Installation
+
+```bash
+python sdk.py check
+```
+
+Output should show:
+```
+✅ Cache available
+✅ Rate limiting available
+✅ Embedding clustering available
+✅ Encryption available
+```

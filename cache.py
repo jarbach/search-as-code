@@ -3,6 +3,7 @@
 Search-as-Code SDK - Cross-Session Caching (Phase 2 Feature #2)
 
 Simple cache wrapper for search operations using Lite-LCM storage.
+Includes optional encryption for sensitive data (alert baselines, etc.).
 """
 
 import hashlib
@@ -19,6 +20,17 @@ try:
     LITE_LCM_AVAILABLE = True
 except ImportError:
     LITE_LCM_AVAILABLE = False
+
+# Optional encryption support
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import base64
+    ENCRYPTION_AVAILABLE = True
+except ImportError:
+    ENCRYPTION_AVAILABLE = False
+    Fernet = None
 
 
 # Default TTLs (in seconds)
@@ -50,12 +62,46 @@ def generate_cache_key(operation_type: str, query: str, **params) -> str:
 class SearchCache:
     """Cache wrapper for search operations."""
     
-    def __init__(self, enabled: bool = True, ttl_seconds: int = 3600):
+    def __init__(self, enabled: bool = True, ttl_seconds: int = 3600, encryption_key: Optional[str] = None):
         self.enabled = enabled and LITE_LCM_AVAILABLE
         self.ttl_seconds = ttl_seconds
         self.cache = LiteLCM() if self.enabled else None
+        self.encryption_key = encryption_key or os.getenv("SEARCH_CACHE_ENCRYPTION_KEY")
+        self.cipher = None
+        
+        # Initialize cipher if key provided
+        if self.encryption_key and ENCRYPTION_AVAILABLE:
+            self._init_cipher()
     
-    def get(self, cache_key: str) -> tuple[Optional[Any], dict]:
+    def _init_cipher(self):
+        """Initialize Fernet cipher with encryption key."""
+        if not self.encryption_key or not ENCRYPTION_AVAILABLE:
+            return
+        
+        # Derive 32-byte key from password using PBKDF2HMAC
+        salt = b'search_cache_salt_v1'  # Static salt for simplicity
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(self.encryption_key.encode()))
+        self.cipher = Fernet(key)
+    
+    def _encrypt(self, data: bytes) -> bytes:
+        """Encrypt data if cipher available."""
+        if self.cipher:
+            return self.cipher.encrypt(data)
+        return data
+    
+    def _decrypt(self, data: bytes) -> bytes:
+        """Decrypt data if cipher available."""
+        if self.cipher:
+            return self.cipher.decrypt(data)
+        return data
+    
+    def get(self, cache_key: str, decrypt: bool = True) -> tuple[Optional[Any], dict]:
         """Get cached result."""
         metrics = {"cache_hit": False, "cache_key": cache_key}
         
@@ -68,25 +114,55 @@ class SearchCache:
                 metrics["cache_hit"] = True
                 metrics["hit_count"] = result.get("hit_count", 1)
                 metrics["latency_saved_ms"] = 800  # Estimate
-                return result["data"], metrics
+                
+                # Decrypt if needed
+                cached_data = result["data"]
+                if isinstance(cached_data, dict) and cached_data.get("encrypted"):
+                    if decrypt and self.cipher:
+                        try:
+                            decrypted_bytes = self._decrypt(base64.b64decode(cached_data["data"]))
+                            cached_data = json.loads(decrypted_bytes.decode())
+                            metrics["decrypted"] = True
+                        except Exception as e:
+                            metrics["decryption_error"] = str(e)
+                            return None, metrics
+                    else:
+                        metrics["encrypted"] = True
+                        if not decrypt:
+                            return cached_data, metrics
+                        else:
+                            return None, metrics
+                
+                return cached_data, metrics
         except Exception as e:
             pass  # Silently ignore cache errors
         
         return None, metrics
     
-    def set(self, cache_key: str, query: str, results: Any, operation_type: str = "search"):
+    def set(self, cache_key: str, query: str, results: Any, operation_type: str = "search", encrypt: bool = False):
         """Write result to cache."""
         if not self.enabled or not self.cache:
             return False
         
         try:
             query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+            
+            # Encrypt if requested (for sensitive baselines)
+            data_to_store = results
+            if encrypt and self.cipher:
+                data_bytes = json.dumps(results).encode()
+                encrypted_data = self._encrypt(data_bytes)
+                data_to_store = {
+                    "encrypted": True,
+                    "data": base64.b64encode(encrypted_data).decode()
+                }
+            
             self.cache.cache_set(
                 cache_key=cache_key,
                 query_hash=query_hash,
                 operation_type=operation_type,
                 query_params="",
-                results=results,
+                results=data_to_store,
                 ttl_seconds=self.ttl_seconds
             )
             return True

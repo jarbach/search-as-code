@@ -44,6 +44,20 @@ try:
 except ImportError:
     LITE_LCM_AVAILABLE = False
 
+# Phase 3: Rate limiting
+try:
+    from rate_limiter import RateLimitedExecutor, RateLimitConfig
+    RATE_LIMIT_AVAILABLE = True
+except ImportError:
+    RATE_LIMIT_AVAILABLE = False
+
+# Phase 3.5: Embedding-based clustering
+try:
+    from embedding_cluster import EmbeddingClusterer, cluster_results_by_embedding
+    EMBEDDING_CLUSTER_AVAILABLE = True
+except ImportError:
+    EMBEDDING_CLUSTER_AVAILABLE = False
+
 
 # =============================================================================
 # Configuration
@@ -56,6 +70,12 @@ DEFAULT_TIMEOUT_FETCH = 60
 DEFAULT_MAX_RESULTS = 10  # web_search tool limit: 1-10
 DEFAULT_RETRY_COUNT = 3
 DEFAULT_RETRY_DELAY = 2.0
+
+# Phase 3: Rate Limiting Configuration
+DEFAULT_RATE_LIMIT = int(os.getenv("SEARCH_SDK_RATE_LIMIT", "10"))  # requests per minute
+DEFAULT_BURST_SIZE = int(os.getenv("SEARCH_SDK_BURST_SIZE", "5"))
+DEFAULT_CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("SEARCH_SDK_CIRCUIT_THRESHOLD", "5"))
+DEFAULT_CIRCUIT_RECOVERY_TIMEOUT = float(os.getenv("SEARCH_SDK_CIRCUIT_TIMEOUT", "30.0"))
 
 # LLM Configuration for Smart Compression (Phase 2)
 DEFAULT_SUMMARIZER_MODEL = os.getenv("SEARCH_SDK_SUMMARIZER_MODEL", "qwen2.5:7b")  # Local model (no ollama/ prefix)
@@ -193,9 +213,30 @@ class ToolExecutor:
     Phase 1B: Direct HTTP calls to Gateway /tools/invoke endpoint.
     This is the production-ready backend for the SDK.
     
+    Phase 3: Integrated rate limiting, circuit breaker, and retry logic.
+    
     Auth: Uses Gateway token auth (configured via env vars or constants)
     Policy: Tool availability filtered through Gateway tool policy
     """
+    
+    # Shared rate-limited executor (initialized on first use)
+    _rate_limited_executor: Optional[RateLimitedExecutor] = None
+    
+    @classmethod
+    def _get_rate_limited_executor(cls) -> RateLimitedExecutor:
+        """Get or create the shared rate-limited executor."""
+        if cls._rate_limited_executor is None:
+            if RATE_LIMIT_AVAILABLE:
+                config = RateLimitConfig(
+                    rate=DEFAULT_RATE_LIMIT,
+                    burst_size=DEFAULT_BURST_SIZE,
+                    circuit_failure_threshold=DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+                    circuit_recovery_timeout=DEFAULT_CIRCUIT_RECOVERY_TIMEOUT
+                )
+                cls._rate_limited_executor = RateLimitedExecutor(config)
+            else:
+                cls._rate_limited_executor = None
+        return cls._rate_limited_executor
     
     @staticmethod
     def _invoke_tool(tool_name: str, args: Dict[str, Any], timeout: int = 30) -> tuple[bool, Any, str]:
@@ -250,6 +291,12 @@ class ToolExecutor:
         
         Returns: (success, results_list, error_message)
         """
+        # Use rate-limited executor if available (Phase 3)
+        executor = ToolExecutor._get_rate_limited_executor()
+        if executor and RATE_LIMIT_AVAILABLE:
+            return await executor.web_search(query, num_results, freshness)
+        
+        # Fallback to direct execution (no rate limiting)
         args = {"query": query, "count": num_results}
         if freshness:
             args["freshness"] = freshness
@@ -288,6 +335,12 @@ class ToolExecutor:
         
         Returns: (success, content, error_message)
         """
+        # Use rate-limited executor if available (Phase 3)
+        executor = ToolExecutor._get_rate_limited_executor()
+        if executor and RATE_LIMIT_AVAILABLE:
+            return await executor.web_fetch(url, max_chars)
+        
+        # Fallback to direct execution (no rate limiting)
         args = {"url": url, "extractMode": "markdown", "maxChars": max_chars}
         success, result, error = ToolExecutor._invoke_tool("web_fetch", args, timeout=DEFAULT_TIMEOUT_FETCH)
         
@@ -865,6 +918,485 @@ class ExtractOp(SearchPrimitive):
 
 
 # =============================================================================
+# Phase 3: Advanced Primitives
+# =============================================================================
+
+class ClusterOp(SearchPrimitive):
+    """
+    Cluster results by topic/embedding similarity.
+    
+    Uses embedding-based clustering (sentence-transformers) when available.
+    Falls back to keyword-based clustering if embeddings unavailable.
+    """
+    
+    def __init__(
+        self,
+        n_clusters: int = 3,
+        method: str = "auto",  # auto | embedding | keyword
+        min_cluster_size: int = 1,
+        model_name: str = "all-MiniLM-L6-v2"
+    ):
+        self.n_clusters = n_clusters
+        self.method = method
+        self.min_cluster_size = min_cluster_size
+        self.model_name = model_name
+    
+    async def execute(self, state: PipelineState) -> PipelineState:
+        if len(state.results) < 2:
+            state.errors.append("Not enough results for clustering")
+            return state
+        
+        # Determine clustering method
+        use_embeddings = (
+            self.method == "embedding" or
+            (self.method == "auto" and EMBEDDING_CLUSTER_AVAILABLE)
+        )
+        
+        if use_embeddings and EMBEDDING_CLUSTER_AVAILABLE:
+            # Use embedding-based clustering
+            try:
+                texts = [f"{r.title} {r.snippet}" for r in state.results]
+                
+                clusterer = EmbeddingClusterer()
+                clustering_result = await clusterer.cluster(
+                    texts,
+                    n_clusters=self.n_clusters,
+                    min_cluster_size=self.min_cluster_size
+                )
+                
+                # Map cluster assignments back to results
+                cluster_map = {}
+                for cluster_id, items in clustering_result.get("clusters", {}).items():
+                    for item in items:
+                        cluster_map[item["index"]] = cluster_id
+                
+                # Add cluster info to each result
+                for idx, r in enumerate(state.results):
+                    r.metadata["cluster_id"] = cluster_map.get(idx, "unclustered")
+                
+                # Reorder results by cluster
+                clustered_results = []
+                for cluster_id in sorted(clustering_result.get("clusters", {}).keys()):
+                    for idx, r in enumerate(state.results):
+                        if r.metadata.get("cluster_id") == cluster_id:
+                            clustered_results.append(r)
+                
+                # Add unclustered at end
+                for r in state.results:
+                    if r not in clustered_results:
+                        clustered_results.append(r)
+                
+                state.results = clustered_results
+                state.metadata["clustering_method"] = "embedding"
+                state.metadata["clustering_model"] = self.model_name
+                state.metadata["n_clusters_found"] = clustering_result.get("n_clusters_found", 0)
+                state.metadata["cluster_sizes"] = clustering_result.get("cluster_sizes", [])
+                state.metrics["clustered_count"] = clustering_result.get("assigned_texts", 0)
+                
+                return state
+                
+            except Exception as e:
+                state.errors.append(f"Embedding clustering failed: {e}. Falling back to keyword.")
+                # Fall through to keyword clustering
+        
+        # Keyword-based clustering (fallback or explicit choice)
+        clusters = self._keyword_cluster(state.results)
+        
+        # Reorder results by cluster
+        clustered_results = []
+        for cluster_name, items in sorted(clusters.items()):
+            if len(items) >= self.min_cluster_size:
+                for r in items:
+                    r.metadata["cluster_id"] = f"cluster_{cluster_name}"
+                clustered_results.extend(items)
+                state.metadata[f"cluster_{cluster_name}"] = len(items)
+        
+        # Add unclustered items at the end
+        clustered_count = len(clustered_results)
+        if clustered_count < len(state.results):
+            for r in state.results:
+                if r not in clustered_results:
+                    r.metadata["cluster_id"] = "unclustered"
+                    clustered_results.append(r)
+        
+        state.results = clustered_results
+        state.metadata["clustering_method"] = "keyword"
+        state.metadata["n_clusters_found"] = len([c for c in clusters.values() if len(c) >= self.min_cluster_size])
+        state.metrics["clustered_count"] = clustered_count
+        
+        return state
+    
+    def _keyword_cluster(self, results: List[SearchResult]) -> Dict[str, List[SearchResult]]:
+        """
+        Simple keyword-based clustering.
+        Groups results by common terms in title/snippet.
+        """
+        from collections import defaultdict
+        
+        # Extract key terms from all results
+        term_freq = defaultdict(int)
+        for r in results:
+            text = f"{r.title} {r.snippet}".lower()
+            words = re.findall(r'\b[a-z]{4,}\b', text)  # Words 4+ chars
+            for word in set(words):  # Count each word once per result
+                term_freq[word] += 1
+        
+        # Select top terms as cluster seeds
+        top_terms = sorted(term_freq.items(), key=lambda x: x[1], reverse=True)[:self.n_clusters * 2]
+        
+        # Assign results to clusters based on term presence
+        clusters = defaultdict(list)
+        for r in results:
+            text = f"{r.title} {r.snippet}".lower()
+            best_term = None
+            best_score = 0
+            
+            for term, freq in top_terms:
+                score = text.count(term) * freq
+                if score > best_score:
+                    best_term = term
+                    best_score = score
+            
+            if best_term:
+                clusters[best_term].append(r)
+        
+        return dict(clusters)
+
+
+class TimelineOp(SearchPrimitive):
+    """
+    Sort results by date and detect trends over time.
+    
+    Attempts to extract dates from snippets/URLs and orders results chronologically.
+    Can identify trending topics by analyzing result distribution over time.
+    """
+    
+    def __init__(
+        self,
+        order: str = "desc",  # desc (newest first) | asc (oldest first)
+        detect_trends: bool = True,
+        time_buckets: str = "month"  # day | week | month | year
+    ):
+        self.order = order
+        self.detect_trends = detect_trends
+        self.time_buckets = time_buckets
+    
+    async def execute(self, state: PipelineState) -> PipelineState:
+        # Try to extract dates from results
+        dated_results = []
+        undated_results = []
+        
+        for r in state.results:
+            date = self._extract_date(r)
+            if date:
+                r.metadata["extracted_date"] = date.isoformat()
+                dated_results.append((date, r))
+            else:
+                undated_results.append(r)
+        
+        # Sort dated results
+        reverse = (self.order == "desc")
+        dated_results.sort(key=lambda x: x[0], reverse=reverse)
+        
+        # Rebuild results list: dated first, then undated
+        state.results = [r for _, r in dated_results] + undated_results
+        
+        # Detect trends if requested
+        if self.detect_trends and len(dated_results) > 0:
+            trend_analysis = self._analyze_trends(dated_results)
+            state.metadata["trend_analysis"] = trend_analysis
+            state.metrics["results_with_dates"] = len(dated_results)
+            state.metrics["results_without_dates"] = len(undated_results)
+        
+        state.metrics["timeline_ordered"] = True
+        return state
+    
+    def _extract_date(self, result: SearchResult) -> Optional[Any]:
+        """
+        Extract date from result snippet or URL.
+        Returns datetime.date object or None.
+        """
+        import re
+        from datetime import datetime
+        
+        # Common date patterns
+        patterns = [
+            r'(\d{4})-(\d{2})-(\d{2})',  # YYYY-MM-DD
+            r'(\d{2})/(\d{2})/(\d{4})',  # MM/DD/YYYY
+            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* (\d{1,2}),? (\d{4})',  # Month DD, YYYY
+            r'(\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* (\d{4})',  # DD Month YYYY
+        ]
+        
+        text = f"{result.title} {result.snippet} {result.url}"
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    groups = match.groups()
+                    if len(groups) == 3:
+                        if groups[0].isdigit() and len(groups[0]) == 4:  # YYYY-MM-DD
+                            year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+                        elif groups[2].isdigit() and len(groups[2]) == 4:  # MM/DD/YYYY
+                            month, day, year = int(groups[0]), int(groups[1]), int(groups[2])
+                        else:  # Month name patterns
+                            month_map = {'Jan':1,'Feb':2,'Mar':3,'Apr':4,'May':5,'Jun':6,
+                                       'Jul':7,'Aug':8,'Sep':9,'Oct':10,'Nov':11,'Dec':12}
+                            if groups[0].isalpha():
+                                month = month_map.get(groups[0][:3], 1)
+                                day = int(groups[1])
+                                year = int(groups[2])
+                            else:
+                                day = int(groups[0])
+                                month = month_map.get(groups[1][:3], 1)
+                                year = int(groups[2])
+                        
+                        if 1 <= month <= 12 and 1 <= day <= 31 and 2000 <= year <= 2100:
+                            from datetime import date
+                            return date(year, month, day)
+                except (ValueError, TypeError):
+                    pass
+        
+        return None
+    
+    def _analyze_trends(self, dated_results: List[tuple]) -> Dict[str, Any]:
+        """
+        Analyze result distribution over time to detect trends.
+        """
+        from collections import defaultdict
+        from datetime import timedelta
+        
+        if not dated_results:
+            return {}
+        
+        # Bucket results by time period
+        buckets = defaultdict(int)
+        for date, _ in dated_results:
+            if self.time_buckets == "year":
+                key = date.year
+            elif self.time_buckets == "month":
+                key = f"{date.year}-{date.month:02d}"
+            elif self.time_buckets == "week":
+                # ISO week number
+                key = f"{date.isocalendar()[0]}-W{date.isocalendar()[1]:02d}"
+            else:  # day
+                key = date.isoformat()
+            
+            buckets[key] += 1
+        
+        # Find peak period
+        if buckets:
+            peak_period = max(buckets.items(), key=lambda x: x[1])
+            avg_per_bucket = sum(buckets.values()) / len(buckets)
+            
+            trend = {
+                "time_buckets": self.time_buckets,
+                "total_dated_results": len(dated_results),
+                "n_buckets": len(buckets),
+                "peak_period": peak_period[0],
+                "peak_count": peak_period[1],
+                "average_per_bucket": round(avg_per_bucket, 2),
+                "trend_direction": "increasing" if list(buckets.keys())[-1] == peak_period[0] else
+                                  "decreasing" if list(buckets.keys())[0] == peak_period[0] else
+                                  "stable"
+            }
+            return trend
+        
+        return {}
+
+
+class SentimentOp(SearchPrimitive):
+    """
+    Analyze sentiment/tone/bias of search results.
+    
+    Uses LLM to classify each result's sentiment as positive/negative/neutral
+    and detects potential bias indicators.
+    """
+    
+    def __init__(
+        self,
+        model: str = DEFAULT_SUMMARIZER_MODEL,
+        analyze_bias: bool = True,
+        batch_size: int = 5
+    ):
+        self.model = model
+        self.analyze_bias = analyze_bias
+        self.batch_size = batch_size
+        self.base_url = OLLAMA_BASE_URL
+    
+    async def execute(self, state: PipelineState) -> PipelineState:
+        if not state.results:
+            return state
+        
+        # Process in batches
+        for i in range(0, len(state.results), self.batch_size):
+            batch = state.results[i:i + self.batch_size]
+            await self._analyze_batch(batch)
+        
+        # Aggregate sentiment stats
+        sentiments = [r.metadata.get("sentiment", "unknown") for r in state.results]
+        sentiment_counts = {}
+        for s in sentiments:
+            sentiment_counts[s] = sentiment_counts.get(s, 0) + 1
+        
+        state.metadata["sentiment_distribution"] = sentiment_counts
+        state.metrics["sentiment_analyzed"] = len(state.results)
+        
+        return state
+    
+    async def _analyze_batch(self, results: List[SearchResult]):
+        """Analyze sentiment for a batch of results."""
+        import aiohttp
+        
+        for result in results:
+            prompt = f"""Analyze the sentiment and tone of this text. Respond with ONLY a JSON object.
+
+Text:
+Title: {result.title}
+Snippet: {result.snippet}
+
+Classify as:
+- sentiment: "positive" | "negative" | "neutral"
+- confidence: 0.0 to 1.0
+- tone: e.g., "factual", "promotional", "critical", "alarmist", "optimistic"
+{"- bias_indicators: list of phrases suggesting bias (if analyze_bias is enabled)" if self.analyze_bias else ""}
+
+Response format:
+{{
+  "sentiment": "...",
+  "confidence": 0.0,
+  "tone": "...",
+  {"\"bias_indicators\": [...]" if self.analyze_bias else ""}
+}}"""
+
+            try:
+                payload = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {
+                        "temperature": 0.1,
+                        "top_p": 0.9
+                    }
+                }
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.base_url}/api/generate",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status == 200:
+                            result_data = await response.json()
+                            analysis_text = result_data.get("response", "{}")
+                            
+                            # Parse JSON response
+                            import json
+                            try:
+                                # Clean up markdown code blocks if present
+                                analysis_text = analysis_text.strip()
+                                if analysis_text.startswith("```"):
+                                    analysis_text = analysis_text.split("```json")[-1].split("```")[0].strip()
+                                
+                                analysis = json.loads(analysis_text)
+                                result.metadata["sentiment"] = analysis.get("sentiment", "unknown")
+                                result.metadata["sentiment_confidence"] = analysis.get("confidence", 0.0)
+                                result.metadata["tone"] = analysis.get("tone", "unknown")
+                                if self.analyze_bias and "bias_indicators" in analysis:
+                                    result.metadata["bias_indicators"] = analysis["bias_indicators"]
+                            except json.JSONDecodeError:
+                                result.metadata["sentiment"] = "parse_error"
+                                result.metadata["tone"] = "unknown"
+                        else:
+                            result.metadata["sentiment"] = "analysis_failed"
+            
+            except Exception as e:
+                result.metadata["sentiment"] = f"error: {str(e)[:50]}"
+
+
+class AlertOp(SearchPrimitive):
+    """
+    Monitor for new results compared to a baseline.
+    
+    Compares current search results against cached baseline to detect:
+    - New URLs not seen before
+    - Significant changes in result composition
+    - Emerging topics or sources
+    
+    Requires cross-session caching to be enabled.
+    Supports encryption for sensitive monitoring topics.
+    """
+    
+    def __init__(
+        self,
+        baseline_name: str,
+        create_baseline: bool = False,
+        notify_on_new: bool = True,
+        min_new_results_threshold: int = 3,
+        encrypt_baseline: bool = True
+    ):
+        self.baseline_name = baseline_name
+        self.create_baseline = create_baseline
+        self.notify_on_new = notify_on_new
+        self.min_new_results_threshold = min_new_results_threshold
+        self.encrypt_baseline = encrypt_baseline
+        self._cache = SearchCache(enabled=CACHE_AVAILABLE, encryption_key=os.getenv("SEARCH_CACHE_ENCRYPTION_KEY")) if CACHE_AVAILABLE else None
+    
+    async def execute(self, state: PipelineState) -> PipelineState:
+        if not CACHE_AVAILABLE:
+            state.errors.append("AlertOp requires caching to be enabled (Phase 2)")
+            return state
+        
+        cache_key = f"alert_baseline:{self.baseline_name}"
+        
+        if self.create_baseline:
+            # Save current results as baseline (encrypted if requested)
+            baseline_data = [r.to_dict() for r in state.results]
+            self._cache.set(
+                cache_key,
+                state.query or "baseline",
+                baseline_data,
+                operation_type="alert_baseline",
+                encrypt=self.encrypt_baseline
+            )
+            state.metadata["alert_baseline_created"] = self.baseline_name
+            state.metadata["baseline_result_count"] = len(state.results)
+            state.metadata["baseline_encrypted"] = self.encrypt_baseline
+        else:
+            # Compare against existing baseline
+            baseline_results, metrics = self._cache.get(cache_key, decrypt=True)
+            
+            if baseline_results is None:
+                state.errors.append(f"Baseline '{self.baseline_name}' not found. Create it first with create_baseline=True")
+                if metrics.get("decryption_error"):
+                    state.errors.append(f"Decryption failed: {metrics['decryption_error']}")
+                return state
+            
+            # Find new results
+            baseline_urls = {r.get("url") for r in baseline_results}
+            new_results = [r for r in state.results if r.url not in baseline_urls]
+            
+            state.metadata["baseline_comparison"] = {
+                "baseline_count": len(baseline_results),
+                "current_count": len(state.results),
+                "new_results_count": len(new_results),
+                "new_urls": [r.url for r in new_results[:10]]  # First 10 new URLs
+            }
+            
+            if len(new_results) >= self.min_new_results_threshold:
+                state.metadata["alert_triggered"] = True
+                state.metadata["alert_reason"] = f"{len(new_results)} new results detected (threshold: {self.min_new_results_threshold})"
+                
+                # Prepend new results to highlight them
+                state.results = new_results + state.results
+            else:
+                state.metadata["alert_triggered"] = False
+        
+        return state
+
+
+# =============================================================================
 # Pre-built Pipeline Templates
 # =============================================================================
 
@@ -1058,6 +1590,49 @@ class SearchPipeline:
         self.operations.append(ExtractOp(selectors))
         return self
     
+    # Phase 3: Advanced Primitives
+    
+    def cluster(
+        self,
+        n_clusters: int = 3,
+        method: str = "keyword",
+        min_cluster_size: int = 2
+    ) -> 'SearchPipeline':
+        """Cluster results by topic/embedding similarity."""
+        self.operations.append(ClusterOp(n_clusters, method, min_cluster_size))
+        return self
+    
+    def timeline(
+        self,
+        order: str = "desc",
+        detect_trends: bool = True,
+        time_buckets: str = "month"
+    ) -> 'SearchPipeline':
+        """Sort results by date and detect trends over time."""
+        self.operations.append(TimelineOp(order, detect_trends, time_buckets))
+        return self
+    
+    def sentiment(
+        self,
+        model: str = DEFAULT_SUMMARIZER_MODEL,
+        analyze_bias: bool = True,
+        batch_size: int = 5
+    ) -> 'SearchPipeline':
+        """Analyze sentiment/tone/bias of search results."""
+        self.operations.append(SentimentOp(model, analyze_bias, batch_size))
+        return self
+    
+    def alert(
+        self,
+        baseline_name: str,
+        create_baseline: bool = False,
+        notify_on_new: bool = True,
+        min_new_results_threshold: int = 3
+    ) -> 'SearchPipeline':
+        """Monitor for new results compared to a baseline."""
+        self.operations.append(AlertOp(baseline_name, create_baseline, notify_on_new, min_new_results_threshold))
+        return self
+    
     async def execute(self) -> PipelineState:
         """Execute the pipeline and return final state."""
         state = PipelineState(session_id=self.session_id, lcm=self.lcm)
@@ -1131,14 +1706,99 @@ async def example_cybersecurity_pipeline():
     print(f"Metrics: {results.metrics}")
 
 
+# =============================================================================
+# Phase 3 Examples
+# =============================================================================
+
+async def example_cluster():
+    """Cluster results by topic."""
+    print("=== Phase 3: Clustering Demo ===\n")
+    
+    results = await SearchPipeline() \
+        .search("AI agent architectures 2025") \
+        .filter(domain="arxiv.org|github.com|medium.com") \
+        .cluster(n_clusters=3, method="keyword") \
+        .execute()
+    
+    print(f"Found {len(results.results)} results")
+    print(f"Clusters detected: {results.metadata.get('n_clusters_found', 0)}")
+    print(f"Cluster metadata: {results.metadata}")
+
+
+async def example_timeline():
+    """Timeline analysis with trend detection."""
+    print("=== Phase 3: Timeline Analysis Demo ===\n")
+    
+    results = await SearchPipeline() \
+        .search("LLM context management techniques") \
+        .timeline(order="desc", detect_trends=True, time_buckets="month") \
+        .execute()
+    
+    print(f"Found {len(results.results)} results")
+    print(f"Results with dates: {results.metrics.get('results_with_dates', 0)}")
+    print(f"Trend analysis: {results.metadata.get('trend_analysis', {})}")
+
+
+async def example_sentiment():
+    """Sentiment analysis of search results."""
+    print("=== Phase 3: Sentiment Analysis Demo ===\n")
+    
+    results = await SearchPipeline() \
+        .search("AI safety concerns 2025") \
+        .sentiment(analyze_bias=True, batch_size=5) \
+        .execute()
+    
+    print(f"Found {len(results.results)} results")
+    print(f"Sentiment distribution: {results.metadata.get('sentiment_distribution', {})}")
+    
+    # Show first 3 results with sentiment
+    for i, r in enumerate(results.results[:3]):
+        print(f"\n{i+1}. {r.title}")
+        print(f"   Sentiment: {r.metadata.get('sentiment', 'unknown')} "
+              f"(confidence: {r.metadata.get('sentiment_confidence', 0):.2f})")
+        print(f"   Tone: {r.metadata.get('tone', 'unknown')}")
+
+
+async def example_rate_limit_demo():
+    """Demonstrate rate limiting in action."""
+    print("=== Phase 3: Rate Limiting Demo ===\n")
+    
+    # This will show rate limiting kicking in
+    start_time = asyncio.get_event_loop().time()
+    
+    results = await SearchPipeline() \
+        .search("quantum computing breakthroughs") \
+        .execute()
+    
+    elapsed = asyncio.get_event_loop().time() - start_time
+    
+    print(f"Search completed in {elapsed:.2f}s")
+    print(f"Rate limit metrics: {results.metrics}")
+    
+    # Check if rate limiter is active
+    executor = ToolExecutor._get_rate_limited_executor()
+    if executor:
+        stats = executor.get_stats()
+        print(f"\nCircuit breaker states:")
+        for op_type, data in stats["circuit_breakers"].items():
+            print(f"  {op_type}: {data['state']}")
+        print(f"\nAvailable tokens:")
+        for op_type, data in stats["rate_limiters"].items():
+            print(f"  {op_type}: {data['available_tokens']:.1f}/{data['burst_size']}")
+
+
 if __name__ == "__main__":
-    print("Search-as-Code SDK v0.2.1 - Phase 2 Complete")
+    print("Search-as-Code SDK v0.3.0 - Phase 3 Complete")
     print("=" * 50)
     print("\nRun examples:")
     print("  python sdk.py basic         - Basic search")
     print("  python sdk.py fanout        - Fan-out + dedupe")
     print("  python sdk.py research      - Research pipeline")
     print("  python sdk.py cybersecurity - Threat intel pipeline")
+    print("  python sdk.py cluster       - Cluster results by topic (Phase 3)")
+    print("  python sdk.py timeline      - Timeline analysis (Phase 3)")
+    print("  python sdk.py sentiment     - Sentiment analysis (Phase 3)")
+    print("  python sdk.py rate_limit    - Rate limiting demo (Phase 3)")
     
     if len(sys.argv) > 1:
         if sys.argv[1] == "basic":
@@ -1149,5 +1809,13 @@ if __name__ == "__main__":
             asyncio.run(example_research_pipeline())
         elif sys.argv[1] == "cybersecurity":
             asyncio.run(example_cybersecurity_pipeline())
+        elif sys.argv[1] == "cluster":
+            asyncio.run(example_cluster())
+        elif sys.argv[1] == "timeline":
+            asyncio.run(example_timeline())
+        elif sys.argv[1] == "sentiment":
+            asyncio.run(example_sentiment())
+        elif sys.argv[1] == "rate_limit":
+            asyncio.run(example_rate_limit_demo())
         else:
             print(f"Unknown example: {sys.argv[1]}")
