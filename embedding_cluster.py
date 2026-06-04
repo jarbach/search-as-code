@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Embedding-based Clustering for Search-as-Code SDK
+Embedding-based Clustering for Search-as-Code SDK - Phase 4
 
 Uses sentence-transformers for semantic similarity clustering.
+Embedding cache for performance optimization.
 Fallback to keyword-based clustering if sentence-transformers not available.
 
 Location: /workspace/skills/auto-generated/search-as-code/
@@ -11,6 +12,14 @@ Location: /workspace/skills/auto-generated/search-as-code/
 import asyncio
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+
+# Optional embedding cache
+try:
+    from embedding_cache import get_embedding_cache
+    EMBEDDING_CACHE_AVAILABLE = True
+except ImportError:
+    EMBEDDING_CACHE_AVAILABLE = False
+    get_embedding_cache = None
 
 # Optional dependency
 try:
@@ -33,6 +42,7 @@ class EmbeddingClusterConfig:
     min_cluster_size: int = 1
     max_iterations: int = 100
     random_state: int = 42
+    use_cache: bool = True  # Enable embedding cache
 
 
 class EmbeddingClusterer:
@@ -42,6 +52,7 @@ class EmbeddingClusterer:
     Features:
     - Uses sentence-transformers for high-quality embeddings
     - KMeans clustering for grouping
+    - Embedding cache for performance (Phase 4)
     - Automatic fallback to keyword clustering if unavailable
     - Configurable model and cluster count
     """
@@ -50,6 +61,9 @@ class EmbeddingClusterer:
         self.config = config or EmbeddingClusterConfig()
         self.model = None
         self._model_lock = asyncio.Lock()
+        self._cache = None
+        if self.config.use_cache and EMBEDDING_CACHE_AVAILABLE:
+            self._cache = get_embedding_cache()
     
     async def _ensure_model_loaded(self):
         """Lazy-load the embedding model."""
@@ -99,13 +113,8 @@ class EmbeddingClusterer:
             # Load model
             await self._ensure_model_loaded()
             
-            # Generate embeddings
-            embeddings = self.model.encode(
-                texts,
-                batch_size=32,
-                show_progress_bar=False,
-                convert_to_numpy=True
-            )
+            # Generate embeddings (with caching)
+            embeddings = await self._get_embeddings(texts)
             
             # Perform KMeans clustering
             kmeans = KMeans(
@@ -153,6 +162,65 @@ class EmbeddingClusterer:
             print(f"Embedding clustering failed: {e}. Falling back to keyword method.")
             return await self._keyword_cluster_fallback(texts, n_clusters, min_cluster_size)
     
+    async def _get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """
+        Get embeddings for texts, using cache if available.
+        
+        Args:
+            texts: List of texts to embed
+        
+        Returns:
+            Numpy array of embeddings
+        """
+        if not self._cache or not EMBEDDING_CACHE_AVAILABLE:
+            # No cache, generate directly
+            return self.model.encode(
+                texts,
+                batch_size=32,
+                show_progress_bar=False,
+                convert_to_numpy=True
+            )
+        
+        # Try cache first
+        cache_dict, miss_indices = await self._cache.get_batch(
+            texts, 
+            model_name=self.config.model_name
+        )
+        
+        if not miss_indices:
+            # All hits - reconstruct embedding array
+            first_vec = next(iter(cache_dict.values()))
+            embeddings = np.zeros((len(texts), len(first_vec)))
+            for idx, vec in cache_dict.items():
+                embeddings[idx] = vec
+            return embeddings
+        
+        # Partial miss - generate missing embeddings
+        missing_texts = [texts[i] for i in miss_indices]
+        missing_embeddings = self.model.encode(
+            missing_texts,
+            batch_size=32,
+            show_progress_bar=False,
+            convert_to_numpy=True
+        )
+        
+        # Cache the new embeddings
+        missing_vectors = [
+            missing_embeddings[i] for i in range(len(missing_texts))
+        ]
+        await self._cache.set_batch(missing_texts, missing_vectors, self.config.model_name)
+        
+        # Reconstruct full embedding array
+        all_embeddings = []
+        for i in range(len(texts)):
+            if i in cache_dict:
+                all_embeddings.append(cache_dict[i])
+            else:
+                miss_idx = miss_indices.index(i)
+                all_embeddings.append(missing_embeddings[miss_idx])
+        
+        return np.array(all_embeddings)
+    
     async def _keyword_cluster_fallback(
         self,
         texts: List[str],
@@ -167,34 +235,66 @@ class EmbeddingClusterer:
         all_terms = []
         for text in texts:
             terms = text.lower().split()
-            # Remove stopwords and short words
-            terms = [t for t in terms if len(t) > 3 and t not in {'this', 'that', 'with', 'have', 'been', 'were', 'will', 'would', 'could', 'should'}]
-            all_terms.extend(terms)
+            all_terms.append(Counter(terms))
         
-        # Get top terms for clustering
-        term_counts = Counter(all_terms)
-        top_terms = [term for term, _ in term_counts.most_common(n_clusters * 3)]
+        # Build vocabulary
+        vocab = set()
+        for terms in all_terms:
+            vocab.update(terms.keys())
+        vocab = sorted(vocab)
         
-        # Assign texts to clusters based on top terms
-        clusters = {}
-        for idx, text in enumerate(texts):
-            text_lower = text.lower()
-            best_term = None
-            best_count = 0
+        if not vocab or len(texts) < n_clusters:
+            # Not enough data, put everything in one cluster
+            return {
+                "clusters": {
+                    "cluster_0": [{"text": t[:200], "index": i} for i, t in enumerate(texts)]
+                },
+                "n_clusters_found": 1,
+                "method": "keyword",
+                "total_texts": len(texts),
+                "assigned_texts": len(texts)
+            }
+        
+        # Create simple TF vectors
+        vectors = []
+        for terms in all_terms:
+            vec = [terms.get(word, 0) for word in vocab]
+            vectors.append(vec)
+        
+        # Normalize vectors
+        import math
+        normalized = []
+        for vec in vectors:
+            norm = math.sqrt(sum(x*x for x in vec))
+            if norm > 0:
+                normalized.append([x/norm for x in vec])
+            else:
+                normalized.append(vec)
+        
+        # Simple cosine similarity clustering
+        clusters = {f"cluster_{i}": [] for i in range(n_clusters)}
+        
+        # Assign each text to nearest centroid (random init)
+        import random
+        random.seed(42)
+        centroids = random.sample(normalized, min(n_clusters, len(normalized)))
+        
+        for i, vec in enumerate(normalized):
+            # Find nearest centroid
+            min_dist = float('inf')
+            best_cluster = 0
+            for j, centroid in enumerate(centroids):
+                dist = sum((a-b)**2 for a,b in zip(vec, centroid))
+                if dist < min_dist:
+                    min_dist = dist
+                    best_cluster = j
             
-            for term in top_terms:
-                count = text_lower.count(term)
-                if count > best_count:
-                    best_count = count
-                    best_term = term
-            
-            if best_term:
-                cluster_key = f"cluster_{best_term}"
-                if cluster_key not in clusters:
-                    clusters[cluster_key] = []
-                clusters[cluster_key].append({"text": text[:200], "index": idx})
+            clusters[f"cluster_{best_cluster}"].append({
+                "text": texts[i][:200],
+                "index": i
+            })
         
-        # Filter by min size
+        # Filter by min cluster size
         filtered_clusters = {
             k: v for k, v in clusters.items()
             if len(v) >= min_cluster_size
@@ -205,114 +305,66 @@ class EmbeddingClusterer:
         return {
             "clusters": filtered_clusters,
             "n_clusters_found": len(filtered_clusters),
-            "method": "keyword_fallback",
+            "method": "keyword",
             "cluster_sizes": cluster_sizes,
+            "avg_cluster_size": sum(cluster_sizes) / len(cluster_sizes) if cluster_sizes else 0,
             "total_texts": len(texts),
-            "assigned_texts": sum(cluster_sizes) if cluster_sizes else 0
+            "assigned_texts": sum(cluster_sizes)
         }
 
 
 # =============================================================================
-# Integration with SearchPipeline
+# Module-level singleton
 # =============================================================================
 
-async def cluster_results_by_embedding(
-    results: List[Dict[str, Any]],
-    field: str = "snippet",
-    n_clusters: int = 3,
-    min_cluster_size: int = 1
-) -> Dict[str, Any]:
-    """
-    Cluster search results by semantic similarity.
+_clusterer_instance: Optional[EmbeddingClusterer] = None
+
+
+def get_embedding_clusterer(
+    config: Optional[EmbeddingClusterConfig] = None
+) -> EmbeddingClusterer:
+    """Get or create the global embedding clusterer instance."""
+    global _clusterer_instance
     
-    Args:
-        results: List of search result dicts with 'snippet' field
-        field: Field to use for clustering ('snippet', 'title', 'combined')
-        n_clusters: Number of clusters
-        min_cluster_size: Minimum results per cluster
+    if _clusterer_instance is None:
+        _clusterer_instance = EmbeddingClusterer(config=config)
     
-    Returns:
-        Clustering metadata to add to results
-    """
-    if not EMBEDDING_AVAILABLE:
-        return {
-            "clustering_available": False,
-            "error": "sentence-transformers not installed"
-        }
-    
-    # Extract texts for clustering
-    texts = []
-    for r in results:
-        if field == "combined":
-            text = f"{r.get('title', '')} {r.get('snippet', '')}".strip()
-        else:
-            text = r.get(field, "")
-        
-        if text:
-            texts.append(text)
-        else:
-            texts.append(r.get("url", "unknown"))  # Fallback to URL
-    
-    # Cluster
-    clusterer = EmbeddingClusterer()
-    clustering_result = await clusterer.cluster(texts, n_clusters, min_cluster_size)
-    
-    # Map cluster assignments back to results
-    cluster_map = {}  # index -> cluster_id
-    for cluster_id, items in clustering_result.get("clusters", {}).items():
-        for item in items:
-            cluster_map[item["index"]] = cluster_id
-    
-    # Add cluster info to each result
-    for idx, r in enumerate(results):
-        r["cluster_id"] = cluster_map.get(idx, "unclustered")
-    
-    return {
-        "clustering_available": True,
-        **clustering_result
-    }
+    return _clusterer_instance
 
 
 # =============================================================================
-# Example Usage
+# CLI for testing
 # =============================================================================
-
-async def demo():
-    """Demonstrate embedding-based clustering."""
-    if not EMBEDDING_AVAILABLE:
-        print("⚠️  sentence-transformers not installed")
-        print("Install with: pip install sentence-transformers scikit-learn")
-        return
-    
-    print("=== Embedding-Based Clustering Demo ===\n")
-    
-    # Sample search snippets
-    snippets = [
-        "Machine learning frameworks like TensorFlow and PyTorch enable deep learning research",
-        "PyTorch 2.0 released with improved performance and torch.compile",
-        "TensorFlow 3.0 announcement at Google I/O focuses on mobile deployment",
-        "Natural language processing with transformers and BERT models",
-        "GPT-4 and large language models for text generation tasks",
-        "BERT fine-tuning for sentiment analysis and classification",
-        "Computer vision with convolutional neural networks and ResNet",
-        "Image classification using Vision Transformers (ViT)",
-        "Object detection with YOLO and Faster R-CNN architectures",
-    ]
-    
-    clusterer = EmbeddingClusterer(EmbeddingClusterConfig(n_clusters=3))
-    result = await clusterer.cluster(snippets, n_clusters=3)
-    
-    print(f"Method: {result['method']}")
-    print(f"Clusters found: {result['n_clusters_found']}")
-    print(f"Total texts: {result['total_texts']}")
-    print(f"Assigned: {result['assigned_texts']}")
-    print(f"Avg cluster size: {result['avg_cluster_size']:.1f}\n")
-    
-    for cluster_id, items in result["clusters"].items():
-        print(f"\n{cluster_id} ({len(items)} items):")
-        for item in items[:2]:  # Show first 2
-            print(f"  - {item['text'][:80]}...")
-
 
 if __name__ == "__main__":
-    asyncio.run(demo())
+    import asyncio
+    
+    async def main():
+        print("=== Embedding Cluster Test ===")
+        print()
+        
+        texts = [
+            "Machine learning frameworks like TensorFlow and PyTorch",
+            "Deep learning neural networks for computer vision",
+            "Natural language processing with transformers",
+            "Python web development Django Flask",
+            "JavaScript React Vue frontend frameworks",
+            "Database optimization SQL indexing"
+        ]
+        
+        config = EmbeddingClusterConfig(n_clusters=2, use_cache=True)
+        clusterer = EmbeddingClusterer(config)
+        
+        result = await clusterer.cluster(texts)
+        
+        print(f"Method: {result['method']}")
+        print(f"Clusters found: {result['n_clusters_found']}")
+        for name, items in result['clusters'].items():
+            print(f"\n{name}:")
+            for item in items:
+                print(f"  - {item['text']}")
+        
+        print()
+        print("✅ Test complete")
+    
+    asyncio.run(main())

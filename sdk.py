@@ -58,6 +58,13 @@ try:
 except ImportError:
     EMBEDDING_CLUSTER_AVAILABLE = False
 
+# Phase 4: Metrics collection
+try:
+    from metrics import MetricsCollector, MetricsDashboard, get_metrics_collector
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+
 
 # =============================================================================
 # Configuration
